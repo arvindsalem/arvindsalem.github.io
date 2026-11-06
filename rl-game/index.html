@@ -1,0 +1,307 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Campaign Trail: Q-learning demo</title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 960px; margin: 1rem auto; padding: 0 1rem; color: #222; background: #fafafa; }
+  h1 { margin-bottom: .2rem; }
+  .row { display: flex; flex-wrap: wrap; gap: 1.5rem; align-items: flex-start; }
+  .panel { background: #fff; border: 1px solid #ddd; border-radius: 8px; padding: .8rem 1rem; }
+  #board { display: grid; grid-template-columns: repeat(7, 54px); grid-auto-rows: 54px; gap: 3px; }
+  .cell { display: flex; align-items: center; justify-content: center; font-size: 28px; background: #eef2f7; border-radius: 4px; position: relative; }
+  .cell.S { background: #f8d4d4; }
+  .cell.R { background: #fff2c2; }
+  .cell.H { background: #d6e8ff; }
+  .cell.C { background: #d4f0d4; }
+  .cell.visited::after { content: "✓"; position: absolute; right: 3px; bottom: 0; font-size: 12px; color: #2a7; }
+  .cell.player { outline: 3px solid #36c; }
+  button { margin: 2px; padding: .4rem .7rem; border: 1px solid #99a; border-radius: 6px; background: #f2f4ff; cursor: pointer; }
+  button:hover { background: #e2e6ff; }
+  #pad { display: grid; grid-template-columns: repeat(3, 44px); gap: 2px; margin-top: .5rem; }
+  #pad button { margin: 0; padding: .5rem 0; }
+  label { display: flex; justify-content: space-between; align-items: center; gap: 1rem; margin: 3px 0; }
+  input[type=number] { width: 4.5rem; }
+  #status { font-weight: 600; min-height: 1.4em; }
+  canvas { width: 100%; max-width: 640px; height: auto; background: #fff; }
+  .legend span { margin-right: 1rem; }
+  small { color: #555; }
+</style>
+</head>
+<body>
+<h1>Campaign Trail</h1>
+<p>Get your candidate from headquarters 🏠 to the Capitol 🏛️ in 40 moves. Rallies 🎤 pay points the first time you visit; scandals 💥 end the campaign.
+Play it yourself (arrow keys or buttons), then train a Q-learning agent to play it.</p>
+
+<div class="row">
+  <div class="panel">
+    <div id="board"></div>
+    <p id="status"></p>
+    <div>Moves: <b id="moves">0</b> / 40 &nbsp; Score: <b id="score">0</b></div>
+    <div id="pad">
+      <span></span><button data-k="up">▲</button><span></span>
+      <button data-k="left">◀</button><button data-k="down">▼</button><button data-k="right">▶</button>
+    </div>
+    <button id="newGame">New game (play yourself)</button>
+    <p><small id="stateCount"></small></p>
+  </div>
+
+  <div class="panel" style="min-width: 260px;">
+    <b>Reward points</b> <small>(from reward())</small>
+    <label>Each move (cost) <input type="number" id="r_step" step="1"></label>
+    <label>Rally 🎤 <input type="number" id="r_rally" step="1"></label>
+    <label>Rally pays <select id="rallyMode">
+      <option value="once">first visit only (original)</option>
+      <option value="every">every visit</option>
+    </select></label>
+    <label>Scandal 💥 <input type="number" id="r_scandal" step="1"></label>
+    <label>Reach Capitol 🏛️ <input type="number" id="r_capitol" step="1"></label>
+    <small>Changing a number resets the agent, since its old learning was based on the old points.</small>
+    <hr>
+    <b>Q-learning agent</b>
+    <div>
+      <button id="t100">Train 100 games</button>
+      <button id="t1000">Train 1,000 games</button><br>
+      <button id="reset">Reset agent</button>
+      <button id="watch">Watch it play</button>
+    </div>
+    <p>Games trained: <b id="trained">0</b><br>
+    <small>ε = 0.2, learning rate = 0.2, discount = 0.95, Q starts at 0, seeded random numbers.</small></p>
+  </div>
+</div>
+
+<div class="panel" style="margin-top: 1rem;">
+  <b>Learning curve</b> (each point = 50 training games)
+  <div class="legend"><span style="color:#2563eb">■ Average reward (left axis)</span><span style="color:#d97706">■ Share of games reaching the Capitol (right axis)</span></div>
+  <canvas id="chart" width="640" height="260"></canvas>
+</div>
+
+<script>
+// ---------- Reward (edit the numbers on the page, or here) ----------
+const R = { step: -1, rally: 10, scandal: -50, capitol: 100 };
+
+// Points for one move. `cell` is what the candidate landed on;
+// `newRally` is true only the first time a given rally is visited.
+let rallyMode = 'once';                      // 'once' (original) or 'every' (the "every crowd counts" option)
+function reward(cell, newRally) {
+  let pts = R.step;                          // every move costs a little (time pressure)
+  if (cell === 'R' && (newRally || rallyMode === 'every')) pts += R.rally;   // rally: bonus (once per rally, or on every visit in 'every' mode)
+  if (cell === 'S') pts += R.scandal;        // scandal: big penalty (and the game ends)
+  if (cell === 'C') pts += R.capitol;        // Capitol: the real goal (game ends)
+  return pts;
+}
+
+// ---------- The map ----------
+// H = headquarters (start), C = Capitol (goal), R = rally, S = scandal
+const MAP = [
+  "...S..C",
+  ".R.S...",
+  ".....S.",
+  "SS.R.S.",
+  ".......",
+  ".S.SR..",
+  "...H...",
+];
+const SIZE = 7, MAX_MOVES = 40;
+const ACTIONS = [[-1,0],[1,0],[0,-1],[0,1]];           // up, down, left, right
+const KEYS = { up: 0, down: 1, left: 2, right: 3 };
+const cellAt = (r, c) => MAP[r][c];
+let start, rallies = [];
+for (let r = 0; r < SIZE; r++) for (let c = 0; c < SIZE; c++) {
+  if (MAP[r][c] === 'H') start = [r, c];
+  if (MAP[r][c] === 'R') rallies.push(r * SIZE + c);
+}
+
+// State = position (49 squares) x which rallies are already collected (2^3 = 8 combos).
+// 49 * 8 = 392 states. The move counter is NOT part of the state, which keeps the table small.
+const N_STATES = SIZE * SIZE * (1 << rallies.length);
+const N_ACTIONS = 4;
+const stateOf = g => (g.r * SIZE + g.c) * (1 << rallies.length) + g.mask;
+
+// ---------- Game logic ----------
+function newGame() { return { r: start[0], c: start[1], mask: 0, moves: 0, score: 0, done: false, reachedCapitol: false, hitScandal: false }; }
+
+// Apply action `a` to game `g` (mutates g). Walking into the map edge wastes the move.
+function step(g, a) {
+  const nr = g.r + ACTIONS[a][0], nc = g.c + ACTIONS[a][1];
+  if (nr >= 0 && nr < SIZE && nc >= 0 && nc < SIZE) { g.r = nr; g.c = nc; }
+  g.moves++;
+  const cell = cellAt(g.r, g.c);
+  let newRally = false;
+  if (cell === 'R') {
+    const bit = 1 << rallies.indexOf(g.r * SIZE + g.c);
+    if (!(g.mask & bit)) { newRally = true; g.mask |= bit; }
+  }
+  const pts = reward(cell, newRally);
+  g.score += pts;
+  if (cell === 'C') { g.done = true; g.reachedCapitol = true; }
+  if (cell === 'S') { g.done = true; g.hitScandal = true; }
+  if (g.moves >= MAX_MOVES) g.done = true;
+  return pts;
+}
+
+// ---------- Seeded random numbers (mulberry32) ----------
+function makeRng(seed) {
+  let s = seed >>> 0;
+  return () => {
+    s = (s + 0x6D2B79F5) >>> 0;
+    let t = s;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+// ---------- Q-learning agent ----------
+const EPSILON = 0.2, ALPHA = 0.2, GAMMA = 0.95, SEED = 158;
+let Q, rng, history, watching = false;
+
+function resetAgent() {
+  Q = new Float64Array(N_STATES * N_ACTIONS);    // all Q-values start at 0
+  rng = makeRng(SEED);
+  history = [];                                  // one {reward, goal} per training game
+  drawChart(); updateTrained();
+}
+
+// Best action for state s; ties broken at random using the given rng.
+function bestAction(s, rand) {
+  let best = -Infinity, ties = [];
+  for (let a = 0; a < N_ACTIONS; a++) {
+    const q = Q[s * N_ACTIONS + a];
+    if (q > best) { best = q; ties = [a]; } else if (q === best) ties.push(a);
+  }
+  return ties[Math.floor(rand() * ties.length)];
+}
+
+// Play one training game with epsilon-greedy exploration, updating Q after every move.
+function trainOneGame() {
+  const g = newGame();
+  while (!g.done) {
+    const s = stateOf(g);
+    const a = rng() < EPSILON ? Math.floor(rng() * N_ACTIONS) : bestAction(s, rng);
+    const r = step(g, a);
+    const s2 = stateOf(g);
+    // Q-learning update: move Q(s,a) toward reward + discounted best future value.
+    // If the game ended on a scandal/Capitol there is no future, so no bootstrap term.
+    const terminal = g.reachedCapitol || g.hitScandal;
+    let future = 0;
+    if (!terminal) future = Math.max(...Q.slice(s2 * N_ACTIONS, (s2 + 1) * N_ACTIONS));
+    const i = s * N_ACTIONS + a;
+    Q[i] += ALPHA * (r + GAMMA * future - Q[i]);
+  }
+  history.push({ reward: g.score, goal: g.reachedCapitol ? 1 : 0 });
+}
+
+function train(n) {
+  if (watching) return;
+  for (let i = 0; i < n; i++) trainOneGame();
+  updateTrained(); drawChart();
+}
+
+// ---------- Board / UI ----------
+const boardEl = document.getElementById('board');
+const ICON = { H: '🏠', C: '🏛️', R: '🎤', S: '💥', '.': '' };
+let game = newGame(), mode = 'human';   // 'human' | 'agent'
+
+function render() {
+  boardEl.innerHTML = '';
+  for (let r = 0; r < SIZE; r++) for (let c = 0; c < SIZE; c++) {
+    const cell = cellAt(r, c), d = document.createElement('div');
+    d.className = 'cell ' + cell;
+    const idx = rallies.indexOf(r * SIZE + c);
+    if (idx >= 0 && (game.mask & (1 << idx))) d.classList.add('visited');
+    d.textContent = (r === game.r && c === game.c) ? '🧑‍💼' : ICON[cell];
+    if (r === game.r && c === game.c) d.classList.add('player');
+    boardEl.appendChild(d);
+  }
+  document.getElementById('moves').textContent = game.moves;
+  document.getElementById('score').textContent = game.score;
+  let msg = '';
+  if (game.done) msg = game.reachedCapitol ? '🎉 You reached the Capitol!' : game.hitScandal ? '💥 Scandal! Campaign over.' : '⏱ Out of moves.';
+  document.getElementById('status').textContent = msg;
+}
+
+function humanMove(a) {
+  if (mode !== 'human' || game.done || watching) return;
+  step(game, a); render();
+}
+
+function startHumanGame() { if (watching) return; mode = 'human'; game = newGame(); render(); }
+
+// Watch one greedy game (epsilon = 0) animated, using its own rng so training stays reproducible.
+function watchAgent() {
+  if (watching) return;
+  watching = true; mode = 'agent'; game = newGame(); render();
+  const wrng = makeRng(SEED + 1);
+  const timer = setInterval(() => {
+    step(game, bestAction(stateOf(game), wrng)); render();
+    if (game.done) { clearInterval(timer); watching = false; }
+  }, 250);
+}
+
+function updateTrained() { document.getElementById('trained').textContent = history.length; }
+
+// ---------- Learning curve ----------
+function drawChart() {
+  const cv = document.getElementById('chart'), ctx = cv.getContext('2d');
+  const W = cv.width, H = cv.height, L = 55, Rm = 55, T = 15, B = 30;
+  ctx.clearRect(0, 0, W, H);
+  ctx.font = '12px system-ui';
+  const nb = Math.floor(history.length / 50);
+  const avgR = [], goal = [];
+  for (let b = 0; b < nb; b++) {
+    let sr = 0, sg = 0;
+    for (let i = b * 50; i < b * 50 + 50; i++) { sr += history[i].reward; sg += history[i].goal; }
+    avgR.push(sr / 50); goal.push(sg / 50);
+  }
+  // Axes ranges: reward axis fits the data (and 0); goal share is 0-100%.
+  let lo = Math.min(0, ...avgR), hi = Math.max(10, ...avgR);
+  if (hi === lo) hi = lo + 1;
+  const x = i => L + (nb <= 1 ? 0 : i * (W - L - Rm) / (nb - 1));
+  const yR = v => T + (hi - v) / (hi - lo) * (H - T - B);
+  const yG = v => T + (1 - v) * (H - T - B);
+  // grid + axis labels
+  ctx.strokeStyle = '#ddd'; ctx.fillStyle = '#555';
+  for (let k = 0; k <= 4; k++) {
+    const y = T + k * (H - T - B) / 4;
+    ctx.beginPath(); ctx.moveTo(L, y); ctx.lineTo(W - Rm, y); ctx.stroke();
+    ctx.textAlign = 'right'; ctx.fillText((hi - k * (hi - lo) / 4).toFixed(0), L - 6, y + 4);
+    ctx.textAlign = 'left'; ctx.fillText((100 - k * 25) + '%', W - Rm + 6, y + 4);
+  }
+  ctx.textAlign = 'center'; ctx.fillText('training games (x50)', (L + W - Rm) / 2, H - 5);
+  if (nb === 0) { ctx.fillStyle = '#888'; ctx.fillText('Train at least 50 games to see the curve', W / 2, H / 2); return; }
+  const line = (vals, y, color) => {
+    ctx.strokeStyle = color; ctx.fillStyle = color; ctx.lineWidth = 2; ctx.beginPath();
+    vals.forEach((v, i) => i ? ctx.lineTo(x(i), y(v)) : ctx.moveTo(x(i), y(v)));
+    ctx.stroke();
+    vals.forEach((v, i) => { ctx.beginPath(); ctx.arc(x(i), y(v), nb > 60 ? 1.5 : 3, 0, 7); ctx.fill(); });
+  };
+  line(avgR, yR, '#2563eb'); line(goal, yG, '#d97706'); ctx.lineWidth = 1;
+}
+
+// ---------- Wire up controls ----------
+document.getElementById('t100').onclick = () => train(100);
+document.getElementById('t1000').onclick = () => train(1000);
+document.getElementById('reset').onclick = () => { if (!watching) resetAgent(); };
+document.getElementById('watch').onclick = watchAgent;
+document.getElementById('newGame').onclick = startHumanGame;
+document.querySelectorAll('#pad button').forEach(b => b.onclick = () => humanMove(KEYS[b.dataset.k]));
+document.addEventListener('keydown', e => {
+  const k = { ArrowUp: 0, ArrowDown: 1, ArrowLeft: 2, ArrowRight: 3 }[e.key];
+  if (k === undefined || e.target.tagName === 'INPUT') return;
+  e.preventDefault(); humanMove(k);
+});
+for (const key of Object.keys(R)) {
+  const el = document.getElementById('r_' + key);
+  el.value = R[key];
+  el.onchange = () => { R[key] = Number(el.value) || 0; resetAgent(); startHumanGame(); };
+}
+document.getElementById('rallyMode').onchange = e => { rallyMode = e.target.value; resetAgent(); startHumanGame(); };
+document.getElementById('stateCount').textContent =
+  `State space: 49 squares × ${1 << rallies.length} rally combinations = ${N_STATES} states.`;
+
+resetAgent(); render();
+</script>
+</body>
+</html>
